@@ -144,7 +144,3 @@ Output:
 > Limitations:
 > Struggles with idiomatic expressions, low-resource languages, and complex grammar.
 > In essence, Google Translate is a state-of-the-art application of deep learning and NLP, designed for large-scale and efficient translation services.
-
-# Bias and Limitations
-
-# Summary
