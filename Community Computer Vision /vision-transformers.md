@@ -171,10 +171,288 @@ query("cats.jpg").then((response) => {
 
 # FineTuning Vision Transformer for Object Detection
 
+- Using Hugging Face Transformers and PyTorch: `!pip install -U -q datasets transformers[torch] evaluate timm albumentations accelerate`
+
+1. Get the image and it's height and width
+2. Make a draw object that can draw text and lines on images
+3. Get annotations dict from the sample
+4. Iterate over it
+5. For each iteration, get the bounding box co-ords (x - horizontal, y - vertical, w - width, h - height)
+6. If bounding box measures are normalised scale it otherwise leave it
+7. Draw the rectangle and the class category text
+
+```python
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+def draw_image_from_idx(dataset, idx):
+    sample = dataset[idx]
+    image = sample["image"]
+    annotations = sample["objects"]
+    draw = ImageDraw.Draw(image)
+    width, height = sample["width"], sample["height"]
+
+    for i in range(len(annotations["id"])):
+        box = annotations["bbox"][i]
+        class_idx = annotations["id"][i]
+        x, y, w, h = tuple(box)
+        if max(box) > 1.0:
+            x1, y1 = int(x), int(y)
+            x2, y2 = int(x + w), int(y + h)
+        else:
+            x1 = int(x * width)
+            y1 = int(y * height)
+            x2 = int((x + w) * width)
+            y2 = int((y + h) * height)
+        draw.rectangle((x1, y1, x2, y2), outline="red", width=1)
+        draw.text((x1, y1), annotations["category"][i], fill="white")
+    return image
+
+
+draw_image_from_idx(dataset=train_dataset, idx=10)
+```
+
+- There is a function to plot multiple images
+
+```python
+import matplotlib.pyplot as plt
+
+
+def plot_images(dataset, indices):
+    """
+    Plot images and their annotations.
+    """
+    num_rows = len(indices) // 3
+    num_cols = 3
+    fig, axes = plt.subplots(num_rows, num_cols, figsize=(15, 10))
+
+    for i, idx in enumerate(indices):
+        row = i // num_cols
+        col = i % num_cols
+
+        # Draw image
+        image = draw_image_from_idx(dataset, idx)
+
+        # Display image on the corresponding subplot
+        axes[row, col].imshow(image)
+        axes[row, col].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+
+# Now use the function to plot images
+
+plot_images(train_dataset, range(9))
+```
+
+- Ideally preprocess the data set for the same attributes such as height, width, rotation, resizing etc.
+
+```python
+import albumentations
+import numpy as np
+import torch
+
+transform = albumentations.Compose(
+    [
+        albumentations.Resize(480, 480),
+        albumentations.HorizontalFlip(p=1.0),
+        albumentations.RandomBrightnessContrast(p=1.0),
+    ],
+    bbox_params=albumentations.BboxParams(format="coco", label_fields=["category"]),
+)
+```
+
+- Combining the image and annotation transformations over the whole batch of dataset:
+
+```python
+# transforming a batch
+
+
+def transform_aug_ann(examples):
+    image_ids = examples["image_id"]
+    images, bboxes, area, categories = [], [], [], []
+    for image, objects in zip(examples["image"], examples["objects"]):
+        image = np.array(image.convert("RGB"))[:, :, ::-1]
+        out = transform(image=image, bboxes=objects["bbox"], category=objects["id"])
+
+        area.append(objects["area"])
+        images.append(out["image"])
+        bboxes.append(out["bboxes"])
+        categories.append(out["category"])
+
+    targets = [
+        {"image_id": id_, "annotations": formatted_anns(id_, cat_, ar_, box_)}
+        for id_, cat_, ar_, box_ in zip(image_ids, categories, area, bboxes)
+    ]
+
+    return image_processor(images=images, annotations=targets, return_tensors="pt")
+```
+
 # DEtection TRansformer (DETR)
+
+- DETR is mainly used for object detection tasks, which is the process of detecting objects in an image
+- DEtection TRansformer, DETR for short, simplifies the detector by using an encoder-decoder transformer after the feature extraction backbone to directly predict bounding boxes in parallel, requiring minimal post-processing
+- The feature map of size `[dimension, height, width]` is downsized and then flattened to `[dimension, less than height x width]`
+
+```python
+import torch
+from torch import nn
+from torchvision.models import resnet50
+
+
+class DETR(nn.Module):
+    def __init__(
+        self, num_classes, hidden_dim, nheads, num_encoder_layers, num_decoder_layers
+    ):
+        super().__init__()
+        self.backbone = nn.Sequential(*list(resnet50(pretrained=True).children())[:-2])
+        self.conv = nn.Conv2d(2048, hidden_dim, 1)
+        self.transformer = nn.Transformer(
+            hidden_dim, nheads, num_encoder_layers, num_decoder_layers
+        )
+        self.linear_class = nn.Linear(hidden_dim, num_classes + 1)
+        self.linear_bbox = nn.Linear(hidden_dim, 4)
+        self.query_pos = nn.Parameter(torch.rand(100, hidden_dim))
+        self.row_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
+        self.col_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
+
+    def forward(self, inputs):
+        x = self.backbone(inputs)
+        h = self.conv(x)
+        H, W = h.shape[-2:]
+        pos = (
+            torch.cat(
+                [
+                    self.col_embed[:W].unsqueeze(0).repeat(H, 1, 1),
+                    self.row_embed[:H].unsqueeze(1).repeat(1, W, 1),
+                ],
+                dim=-1,
+            )
+            .flatten(0, 1)
+            .unsqueeze(1)
+        )
+        h = self.transformer(
+            pos + h.flatten(2).permute(2, 0, 1), self.query_pos.unsqueeze(1)
+        )
+        return self.linear_class(h), self.linear_bbox(h).sigmoid()
+```
 
 # Vision Transformer for Image Segmentation
 
+```python
+from transformers import pipeline
+from PIL import Image
+import requests
+
+segmentation = pipeline("image-segmentation", "facebook/maskformer-swin-base-coco")
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = Image.open(requests.get(url, stream=True).raw)
+
+results = segmentation(images=image, subtask="panoptic")
+results
+```
+
 # OneFormer
+
+- Approach to image segmentation, a computer vision task that involves dividing an image into meaningful segments
+
+## Key Features
+
+- Task-Dynamic Mask: decide whether to pay attention to the overall scene, identify specific objects with clear boundaries or combination of both
+- Task-Conditioned Joined Training: instead of training separately for semantic, instance and panoptic segmentation, it uniformly samples the task during training
+- Query-Text Contrastive Loss: versatile-like a multitasking assistant and learn specifics of each task by comparing visual features with textual descriptions
+
+`!pip install -q natten`
+
+```python
+from transformers import OneFormerProcessor, OneFormerForUniversalSegmentation
+from PIL import Image
+import requests
+import matplotlib.pyplot as plt
+
+
+def run_segmentation(image, task_type):
+    """Performs image segmentation based on the given task type.
+
+    Args:
+        image (PIL.Image): The input image.
+        task_type (str): The type of segmentation to perform ('semantic', 'instance', or 'panoptic').
+
+    Returns:
+        PIL.Image: The segmented image.
+
+    Raises:
+        ValueError: If the task type is invalid.
+    """
+
+    processor = OneFormerProcessor.from_pretrained(
+        "shi-labs/oneformer_ade20k_dinat_large"
+    )  # Load once here
+    model = OneFormerForUniversalSegmentation.from_pretrained(
+        "shi-labs/oneformer_ade20k_dinat_large"
+    )
+
+    if task_type == "semantic":
+        inputs = processor(images=image, task_inputs=["semantic"], return_tensors="pt")
+        outputs = model(**inputs)
+        predicted_map = processor.post_process_semantic_segmentation(
+            outputs, target_sizes=[image.size[::-1]]
+        )[0]
+
+    elif task_type == "instance":
+        inputs = processor(images=image, task_inputs=["instance"], return_tensors="pt")
+        outputs = model(**inputs)
+        predicted_map = processor.post_process_instance_segmentation(
+            outputs, target_sizes=[image.size[::-1]]
+        )[0]["segmentation"]
+
+    elif task_type == "panoptic":
+        inputs = processor(images=image, task_inputs=["panoptic"], return_tensors="pt")
+        outputs = model(**inputs)
+        predicted_map = processor.post_process_panoptic_segmentation(
+            outputs, target_sizes=[image.size[::-1]]
+        )[0]["segmentation"]
+
+    else:
+        raise ValueError(
+            "Invalid task type. Choose from 'semantic', 'instance', or 'panoptic'"
+        )
+
+    return predicted_map
+
+
+def show_image_comparison(image, predicted_map, segmentation_title):
+    """Displays the original image and the segmented image side-by-side.
+
+    Args:
+        image (PIL.Image): The original image.
+        predicted_map (PIL.Image): The segmented image.
+        segmentation_title (str): The title for the segmented image.
+    """
+
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.imshow(image)
+    plt.title("Original Image")
+    plt.axis("off")
+    plt.subplot(1, 2, 2)
+    plt.imshow(predicted_map)
+    plt.title(segmentation_title + " Segmentation")
+    plt.axis("off")
+    plt.show()
+
+
+url = "https://huggingface.co/datasets/shi-labs/oneformer_demo/resolve/main/ade20k.jpeg"
+response = requests.get(url, stream=True)
+response.raise_for_status()  # Check for HTTP errors
+image = Image.open(response.raw)
+
+task_to_run = "semantic"
+predicted_map = run_segmentation(image, task_to_run)
+show_image_comparison(image, predicted_map, task_to_run)
+```
 
 # Knowledge Distillation with Vision Transformer
